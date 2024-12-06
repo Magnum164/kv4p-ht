@@ -50,11 +50,11 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
+import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.ImageButton;
 import android.widget.ImageView;
-import android.widget.ScrollView;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
@@ -76,8 +76,14 @@ import com.google.android.material.snackbar.Snackbar;
 import com.vagell.kv4pht.BR;
 import com.vagell.kv4pht.R;
 import com.vagell.kv4pht.aprs.parser.APRSPacket;
+import com.vagell.kv4pht.aprs.parser.APRSTypes;
 import com.vagell.kv4pht.aprs.parser.InformationField;
 import com.vagell.kv4pht.aprs.parser.MessagePacket;
+import com.vagell.kv4pht.aprs.parser.ObjectField;
+import com.vagell.kv4pht.aprs.parser.PositionField;
+import com.vagell.kv4pht.aprs.parser.Utilities;
+import com.vagell.kv4pht.aprs.parser.WeatherField;
+import com.vagell.kv4pht.data.APRSMessage;
 import com.vagell.kv4pht.data.AppSetting;
 import com.vagell.kv4pht.data.ChannelMemory;
 import com.vagell.kv4pht.databinding.ActivityMainBinding;
@@ -113,7 +119,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String ACTION_USB_PERMISSION = "com.vagell.kv4pht.USB_PERMISSION";
 
     // Radio params and related settings
-    private String activeFrequencyStr = "144.000";
+    private String activeFrequencyStr = "144.0000";
     private int squelch = 0;
     private String callsign = null;
     private boolean stickyPTT = false;
@@ -123,10 +129,13 @@ public class MainActivity extends AppCompatActivity {
     public static final int REQUEST_ADD_MEMORY = 0;
     public static final int REQUEST_EDIT_MEMORY = 1;
     public static final int REQUEST_SETTINGS = 2;
+    public static final int REQUEST_FIRMWARE = 3;
 
     private MainViewModel viewModel;
-    private RecyclerView recyclerView;
-    private MemoriesAdapter adapter;
+    private RecyclerView memoriesRecyclerView;
+    private MemoriesAdapter memoriesAdapter;
+    private RecyclerView aprsRecyclerView;
+    private APRSAdapter aprsAdapter;
 
     private ThreadPoolExecutor threadPoolExecutor = null;
 
@@ -151,6 +160,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
         threadPoolExecutor = new ThreadPoolExecutor(2,
                 10, 0, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>());
 
@@ -162,9 +173,9 @@ public class MainActivity extends AppCompatActivity {
         binding.setVariable(BR.viewModel, viewModel);
 
         // Prepare a RecyclerView for the list of channel memories
-        recyclerView = findViewById(R.id.memoriesList);
-        recyclerView.setLayoutManager(new LinearLayoutManager(this));
-        adapter = new MemoriesAdapter(new MemoriesAdapter.MemoryListener() {
+        memoriesRecyclerView = findViewById(R.id.memoriesList);
+        memoriesRecyclerView.setLayoutManager(new LinearLayoutManager(this));
+        memoriesAdapter = new MemoriesAdapter(new MemoriesAdapter.MemoryListener() {
             @Override
             public void onMemoryClick(ChannelMemory memory) {
                 // Actually tune to it.
@@ -179,7 +190,7 @@ public class MainActivity extends AppCompatActivity {
 
                 // Highlight the tapped memory, unhighlight all the others.
                 viewModel.highlightMemory(memory);
-                adapter.notifyDataSetChanged();
+                memoriesAdapter.notifyDataSetChanged();
             }
 
             @Override
@@ -192,7 +203,7 @@ public class MainActivity extends AppCompatActivity {
                         runOnUiThread(new Runnable() {
                             @Override
                             public void run() {
-                                adapter.notifyDataSetChanged();
+                                memoriesAdapter.notifyDataSetChanged();
 
                                 if (radioAudioService != null) {
                                     radioAudioService.tuneToFreq(freq, squelch, false); // Stay on the same freq as the now-deleted memory
@@ -215,9 +226,9 @@ public class MainActivity extends AppCompatActivity {
                 startActivityForResult(intent, REQUEST_EDIT_MEMORY);
             }
         });
-        recyclerView.setAdapter(adapter);
+        memoriesRecyclerView.setAdapter(memoriesAdapter);
 
-        // Observe the LiveData in MainViewModel (so the RecyclerView can populate with the memories)
+        // Observe the channel memories LiveData in MainViewModel (so the RecyclerView can populate with the memories)
         viewModel.getChannelMemories().observe(this, new Observer<List<ChannelMemory>>() {
             @Override
             public void onChanged(List<ChannelMemory> channelMemories) {
@@ -229,8 +240,28 @@ public class MainActivity extends AppCompatActivity {
                         }
                     }
                 }
-                adapter.setMemoriesList(channelMemories);
-                adapter.notifyDataSetChanged();
+                memoriesAdapter.setMemoriesList(channelMemories);
+                memoriesAdapter.notifyDataSetChanged();
+            }
+        });
+
+        // Prepare a RecyclerView for the list APRS messages we've received in the past
+        aprsRecyclerView = findViewById(R.id.aprsRecyclerView);
+        aprsRecyclerView.setLayoutManager(new LinearLayoutManager(this));
+        aprsAdapter = new APRSAdapter();
+        aprsRecyclerView.setAdapter(aprsAdapter);
+
+        // Observe the APRS messages LiveData in MainViewModel (so the RecyclerView can populate with the APRS messages)
+        viewModel.getAPRSMessages().observe(this, new Observer<List<APRSMessage>>() {
+            @Override
+            public void onChanged(List<APRSMessage> aprsMessages) {
+                aprsAdapter.setAPRSMessageList(aprsMessages);
+                aprsAdapter.notifyDataSetChanged();
+
+                // Scroll to the bottom when a new message is added
+                if (aprsMessages != null && !aprsMessages.isEmpty()) {
+                    aprsRecyclerView.scrollToPosition(aprsMessages.size() - 1);
+                }
             }
         });
 
@@ -267,6 +298,8 @@ public class MainActivity extends AppCompatActivity {
         });
         viewModel.loadData();
     }
+
+    final Context context = this;
 
     /** Defines callbacks for service binding, passed to bindService(). */
     private ServiceConnection connection = new ServiceConnection() {
@@ -316,8 +349,80 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 @Override
-                public void unsupportedFirmware(int firmwareVer) {
+                public void outdatedFirmware(int firmwareVer) {
                     showVersionSnackbar(firmwareVer);
+                }
+
+                @Override
+                public void missingFirmware() {
+                    showVersionSnackbar(-1);
+                }
+
+                @Override
+                public void txAllowed(boolean allowed) {
+                    // Only enable the PTT button when tx is allowed (e.g. within ham band).
+                    findViewById(R.id.pttButton).setClickable(allowed);
+                }
+
+                @Override
+                public void txStarted() {
+                    if (activeMemoryId == -1) {
+                        return;
+                    }
+
+                    // Display any offset while transmitting.
+                    List<ChannelMemory> channelMemories = viewModel.getChannelMemories().getValue();
+                    if (channelMemories == null) {
+                        return;
+                    }
+                    for (int i = 0; i < channelMemories.size(); i++) {
+                        if (channelMemories.get(i).memoryId == activeMemoryId) {
+                            ChannelMemory memory = channelMemories.get(i);
+                            if (memory.offset == ChannelMemory.OFFSET_NONE) {
+                                return; // No offset, can just leave current frequency visible.
+                            }
+
+                            Float freq = Float.parseFloat(memory.frequency);
+                            freq = (memory.offset == ChannelMemory.OFFSET_UP) ? (freq + 0.6f) : (freq - 0.6f);
+                            showFrequency(radioAudioService.validateFrequency("" + freq));
+                            break;
+                        }
+                    }
+                }
+
+                @Override
+                public void txEnded() {
+                    if (activeMemoryId == -1) {
+                        return;
+                    }
+
+                    // Stop displaying any offset now that transmit is done.
+                    List<ChannelMemory> channelMemories = viewModel.getChannelMemories().getValue();
+                    if (channelMemories == null) {
+                        return;
+                    }
+                    for (int i = 0; i < channelMemories.size(); i++) {
+                        if (channelMemories.get(i).memoryId == activeMemoryId) {
+                            ChannelMemory memory = channelMemories.get(i);
+                            Float freq = Float.parseFloat(memory.frequency);
+                            showFrequency(radioAudioService.validateFrequency("" + freq));
+                            break;
+                        }
+                    }
+                }
+
+                @Override
+                public void chatError(String snackbarMsg) {
+                    Snackbar snackbar = Snackbar.make(context, findViewById(R.id.mainTopLevelLayout), snackbarMsg, Snackbar.LENGTH_LONG)
+                            .setBackgroundTint(Color.rgb(140, 20, 0))
+                            .setTextColor(Color.WHITE)
+                            .setAnchorView(findViewById(R.id.textChatInput));
+
+                    // Make the text of the snackbar larger.
+                    TextView snackbarTextView = (TextView) snackbar.getView().findViewById(com.google.android.material.R.id.snackbar_text);
+                    snackbarTextView.setTextSize(20);
+
+                    snackbar.show();
                 }
             };
 
@@ -394,6 +499,18 @@ public class MainActivity extends AppCompatActivity {
             }
         });
         viewModel.loadData();
+
+        // If we lost reference to the radioAudioService, re-establish it
+        if (null == radioAudioService) {
+            Intent intent = new Intent(this, RadioAudioService.class);
+            intent.putExtra("callsign", callsign);
+            intent.putExtra("squelch", squelch);
+            intent.putExtra("activeMemoryId", activeMemoryId);
+            intent.putExtra("activeFrequencyStr", activeFrequencyStr);
+
+            // Binding to the RadioAudioService causes it to start (e.g. play back audio).
+            bindService(intent, connection, Context.BIND_AUTO_CREATE);
+        }
     }
 
     @Override
@@ -407,26 +524,116 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void handleChatPacket(APRSPacket aprsPacket) {
-        final String finalString;
+        // We use duck-typing for APRS messages since the spec is pretty loose with all the ways
+        // you can define different fields and values. Once we know the type, we set aprsMessage.type.
 
-        // Reformat the packet to be more human readable.
+        APRSMessage aprsMessage = new APRSMessage();
         InformationField infoField = aprsPacket.getAprsInformation();
-        if (infoField.getDataTypeIdentifier() == ':') { // APRS "message" type. What we expect for our text chat.
-            MessagePacket messagePacket = new MessagePacket(infoField.getRawBytes(), aprsPacket.getDestinationCall());
-            finalString = aprsPacket.getSourceCall() + " to " + messagePacket.getTargetCallsign() + ": " + messagePacket.getMessageBody();
-        } else { // Raw APRS packet. Useful for things like monitoring 144.39 for misc APRS traffic.
-            // TODO add better implementation of other message types (especially Location and Object, which are common on 144.390MHz).
-            finalString = aprsPacket.toString();
+        WeatherField weatherField = (WeatherField) infoField.getAprsData(APRSTypes.T_WX);
+        PositionField positionField = (PositionField) infoField.getAprsData(APRSTypes.T_POSITION);
+        ObjectField objectField = (ObjectField) infoField.getAprsData(APRSTypes.T_OBJECT);
+        aprsMessage.timestamp = java.time.Instant.now().getEpochSecond();
+
+        // Get the fromCallsign (all APRS messages must have this)
+        aprsMessage.fromCallsign = aprsPacket.getSourceCall();
+
+        // Get the position, if included.
+        if (null != positionField) {
+            aprsMessage.positionLat = positionField.getPosition().getLatitude();
+            aprsMessage.positionLong = positionField.getPosition().getLongitude();
         }
 
-        runOnUiThread(new Runnable() {
+        // Try to find a comment (could be at multiple levels in the packet).
+        String comment = aprsPacket.getComment();
+        if (null != infoField && (null == comment || comment.trim().length() == 0)) {
+            comment = infoField.getComment();
+        }
+        if (null != positionField && (null == comment || comment.trim().length() == 0)) {
+            comment = positionField.getComment();
+        }
+        if (null != objectField && (null == comment || comment.trim().length() == 0)) {
+            comment = objectField.getComment();
+        }
+        if (null != weatherField && (null == comment || comment.trim().length() == 0)) {
+            comment = weatherField.getComment();
+        }
+        if (null != comment && comment.trim().length() > 0) {
+            aprsMessage.comment = comment;
+        }
+
+        if (null != weatherField) { // APRS "weather" (i.e. any message with weather data attached)
+            aprsMessage.type = APRSMessage.WEATHER_TYPE;
+            aprsMessage.temperature = (null == weatherField.getTemp()) ? 0 : weatherField.getTemp();
+            aprsMessage.humidity = (null == weatherField.getHumidity()) ? 0 : weatherField.getHumidity();
+            aprsMessage.pressure = (null == weatherField.getPressure()) ? 0 : weatherField.getPressure();
+            aprsMessage.rain = (null == weatherField.getRainLast24Hours()) ? 0 : weatherField.getRainLast24Hours(); // TODO don't ignore other rain measurements
+            aprsMessage.snow = (null == weatherField.getSnowfallLast24Hours()) ? 0 : weatherField.getSnowfallLast24Hours();
+            aprsMessage.windForce = (null == weatherField.getWindSpeed()) ? 0 : weatherField.getWindSpeed();
+            aprsMessage.windDir = (null == weatherField.getWindDirection()) ? "" : Utilities.degressToCardinal(weatherField.getWindDirection());
+
+            // Log.d("DEBUG", "Weather packet received");
+        } else if (infoField.getDataTypeIdentifier() == ':') { // APRS "message" type. What we expect for our text chat.
+            aprsMessage.type = APRSMessage.MESSAGE_TYPE;
+            MessagePacket messagePacket = new MessagePacket(infoField.getRawBytes(), aprsPacket.getDestinationCall());
+
+            if (messagePacket.isAck()) {
+                aprsMessage.wasAcknowledged = true;
+                try {
+                    String msgNumStr = messagePacket.getMessageNumber();
+                    if (msgNumStr != null) {
+                        aprsMessage.msgNum = Integer.parseInt(msgNumStr.trim());
+                    }
+                } catch (Exception e) {
+                    Log.d("DEBUG", "Warning: Bad message number in APRS ack, ignoring: '" + messagePacket.getMessageNumber() + "'");
+                    e.printStackTrace();
+                    return;
+                }
+                // Log.d("DEBUG", "Message ack received");
+            } else {
+                aprsMessage.toCallsign = messagePacket.getTargetCallsign();
+                aprsMessage.msgBody = messagePacket.getMessageBody();
+                // Log.d("DEBUG", "Message packet received");
+            }
+        } else if (infoField.getDataTypeIdentifier() == ';') { // APRS "object"
+            aprsMessage.type = APRSMessage.OBJECT_TYPE;
+            if (null != objectField) {
+                aprsMessage.objName = objectField.getObjectName();
+                // Log.d("DEBUG", "Object packet received");
+            }
+        }
+
+        if (threadPoolExecutor == null) {
+            return;
+        }
+
+        threadPoolExecutor.execute(new Runnable() {
             @Override
             public void run() {
-                TextView chatLog = findViewById(R.id.textChatLog);
-                chatLog.append(finalString + "\n");
+                APRSMessage oldAPRSMessage = null;
+                if (aprsMessage.wasAcknowledged) {
+                    // When this is an ack, we don't insert anything in the DB, we try to find that old message to ack it.
+                    oldAPRSMessage = MainViewModel.appDb.aprsMessageDao().getMsgToAck(aprsMessage.fromCallsign, aprsMessage.msgNum);
+                    if (null == oldAPRSMessage) {
+                        Log.d("DEBUG", "Can't ack unknown APRS message with number: " + aprsMessage.msgNum);
+                        return;
+                    } else {
+                        // Ack an old message
+                        oldAPRSMessage.wasAcknowledged = true;
+                        MainViewModel.appDb.aprsMessageDao().update(oldAPRSMessage);
+                    }
+                } else {
+                    // Not an ack, add a message
+                    MainViewModel.appDb.aprsMessageDao().insertAll(aprsMessage);
+                }
 
-                ScrollView textChatScrollView = findViewById(R.id.textChatScrollView);
-                textChatScrollView.fullScroll(View.FOCUS_DOWN);
+                viewModel.loadData();
+
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        aprsAdapter.notifyDataSetChanged();
+                    }
+                });
             }
         });
     }
@@ -472,6 +679,10 @@ public class MainActivity extends AppCompatActivity {
                 findViewById(R.id.sendButtonOverlay).setVisibility(View.GONE);
             }
         } else if (screenType == ScreenType.SCREEN_VOICE){
+            hideKeyboard();
+            findViewById(R.id.frequencyContainer).setVisibility(View.VISIBLE);
+            findViewById(R.id.rxAudioCircle).setVisibility(View.VISIBLE);
+
             if (callsignSnackbar != null) {
                 callsignSnackbar.dismiss();
             }
@@ -531,11 +742,32 @@ public class MainActivity extends AppCompatActivity {
 
         ((EditText) findViewById(R.id.textChatInput)).setText("");
 
-        TextView chatLog = findViewById(R.id.textChatLog);
-        chatLog.append(callsign + " to " + targetCallsign + ": " + outText + "\n");
+        if (threadPoolExecutor == null) {
+            return;
+        }
 
-        ScrollView scrollView = findViewById(R.id.textChatScrollView);
-        scrollView.fullScroll(View.FOCUS_DOWN);
+        final APRSMessage aprsMessage = new APRSMessage();
+        aprsMessage.type = APRSMessage.MESSAGE_TYPE;
+        aprsMessage.fromCallsign = callsign.toUpperCase().trim();
+        aprsMessage.toCallsign = targetCallsign.toUpperCase().trim();
+        aprsMessage.msgBody = outText.trim();
+        aprsMessage.timestamp = java.time.Instant.now().getEpochSecond();
+        // TODO include position once we add GPS support, if the user has enabled this setting
+
+        threadPoolExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                MainViewModel.appDb.aprsMessageDao().insertAll(aprsMessage);
+                viewModel.loadData();
+
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        aprsAdapter.notifyDataSetChanged();
+                    }
+                });
+            }
+        });
 
         findViewById(R.id.textChatInput).requestFocus();
     }
@@ -601,6 +833,7 @@ public class MainActivity extends AppCompatActivity {
                 AppSetting lowpassSetting = viewModel.appDb.appSettingDao().getByName("lowpass");
                 AppSetting stickyPTTSetting = viewModel.appDb.appSettingDao().getByName("stickyPTT");
                 AppSetting disableAnimationsSetting = viewModel.appDb.appSettingDao().getByName("disableAnimations");
+                AppSetting maxFreqSetting = viewModel.appDb.appSettingDao().getByName("maxFreq");
                 AppSetting lastMemoryId = viewModel.appDb.appSettingDao().getByName("lastMemoryId");
                 AppSetting lastFreq = viewModel.appDb.appSettingDao().getByName("lastFreq");
                 AppSetting lastGroupSetting = viewModel.appDb.appSettingDao().getByName("lastGroup");
@@ -640,13 +873,18 @@ public class MainActivity extends AppCompatActivity {
                             if (lastFreq != null) {
                                 activeFrequencyStr = lastFreq.value;
                             } else {
-                                activeFrequencyStr = "146.520"; // VHF calling freq
+                                activeFrequencyStr = "144.0000";
                             }
 
                             if (radioAudioService != null) {
                                 radioAudioService.setActiveMemoryId(activeMemoryId);
                                 radioAudioService.setActiveFrequencyStr(activeFrequencyStr);
                             }
+                        }
+
+                        if (maxFreqSetting != null) {
+                            int maxFreq = Integer.parseInt(maxFreqSetting.value);
+                            RadioAudioService.setMaxFreq(maxFreq); // Called statically so static frequency formatter can use it.
                         }
 
                         if (squelchSetting != null) {
@@ -726,17 +964,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void attachListeners() {
+        final Context ctx = this;
+
         ImageButton pttButton = findViewById(R.id.pttButton);
         pttButton.setOnTouchListener(new View.OnTouchListener() {
             @Override
             public boolean onTouch(View v, MotionEvent event) {
-                // If the user tries to transmit, stop scanning so we don't
-                // move to a different frequency during or after the tx.
-                if (radioAudioService != null) {
-                    radioAudioService.setScanning(false, false);
-                }
-                setScanningUi(false);
-
                 boolean touchHandled = false;
                 switch (event.getAction()) {
                     case MotionEvent.ACTION_DOWN:
@@ -748,7 +981,11 @@ public class MainActivity extends AppCompatActivity {
                             if (radioAudioService != null && radioAudioService.getMode() == RadioAudioService.MODE_RX) {
                                 ((Vibrator) getSystemService(Context.VIBRATOR_SERVICE)).vibrate(100);
                                 if (radioAudioService != null) {
-                                    radioAudioService.startPtt(false);
+                                    // If the user tries to transmit, stop scanning so we don't
+                                    // move to a different frequency during or after the tx.
+                                    radioAudioService.setScanning(false, false);
+                                    setScanningUi(false);
+                                    radioAudioService.startPtt();
                                 }
                                 startPttUi(false);
                             } else if (radioAudioService != null && radioAudioService.getMode() == RadioAudioService.MODE_TX) {
@@ -761,7 +998,11 @@ public class MainActivity extends AppCompatActivity {
                         } else {
                             ((Vibrator) getSystemService(Context.VIBRATOR_SERVICE)).vibrate(100);
                             if (radioAudioService != null) {
-                                radioAudioService.startPtt(false);
+                                // If the user tries to transmit, stop scanning so we don't
+                                // move to a different frequency during or after the tx.
+                                radioAudioService.setScanning(false, false);
+                                setScanningUi(false);
+                                radioAudioService.startPtt();
                             }
                             startPttUi(false);
                         }
@@ -785,6 +1026,7 @@ public class MainActivity extends AppCompatActivity {
                 return touchHandled;
             }
         });
+
         pttButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -799,7 +1041,7 @@ public class MainActivity extends AppCompatActivity {
                 if (radioAudioService != null && radioAudioService.getMode() == RadioAudioService.MODE_RX) {
                     ((Vibrator) getSystemService(Context.VIBRATOR_SERVICE)).vibrate(100);
                     if (radioAudioService != null) {
-                        radioAudioService.startPtt(false);
+                        radioAudioService.startPtt();
                     }
                     startPttUi(false);
                 } else if (radioAudioService != null && radioAudioService.getMode() == RadioAudioService.MODE_TX) {
@@ -830,6 +1072,7 @@ public class MainActivity extends AppCompatActivity {
         final View rootView = findViewById(android.R.id.content);
         final View frequencyView = findViewById(R.id.frequencyContainer);
         final EditText activeFrequencyEditText = findViewById(R.id.activeFrequency);
+        final View rxAudioCircleView = findViewById(R.id.rxAudioCircle);
 
         // Track if keyboard is likely visible (and/or screen got short for some reason), so we can
         // make room for critical UI components that must be visible.
@@ -860,17 +1103,21 @@ public class MainActivity extends AppCompatActivity {
                 if (heightDiff > screenHeight * 0.25) { // If more than 25% of the screen height is reduced
                     // Keyboard is visible, hide the top view
                     frequencyView.setVisibility(View.GONE);
+                    rxAudioCircleView.setVisibility(View.GONE);
                 } else {
                     // Keyboard is hidden, show the top view
                     frequencyView.setVisibility(View.VISIBLE);
+                    rxAudioCircleView.setVisibility(View.VISIBLE);
                 }
             }
         });
     }
 
     private void hideKeyboard() {
-        InputMethodManager imm = (InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
-        imm.hideSoftInputFromWindow(this.getCurrentFocus().getWindowToken(), 0);
+        InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (null != imm) {
+            imm.hideSoftInputFromWindow(findViewById(R.id.mainTopLevelLayout).getWindowToken(), 0);
+        }
     }
 
     /**
@@ -878,6 +1125,7 @@ public class MainActivity extends AppCompatActivity {
      * interact with the radio (use RadioAudioService for that).
      */
     private void tuneToFreqUi(String frequencyStr) {
+        final Context ctx = this;
         activeFrequencyStr = radioAudioService.validateFrequency(frequencyStr);
         activeMemoryId = -1;
 
@@ -888,23 +1136,25 @@ public class MainActivity extends AppCompatActivity {
         threadPoolExecutor.execute(new Runnable() {
             @Override
             public void run() {
-                AppSetting lastFreqSetting = viewModel.appDb.appSettingDao().getByName("lastFreq");
-                if (lastFreqSetting != null) {
-                    lastFreqSetting.value = frequencyStr;
-                    viewModel.appDb.appSettingDao().update(lastFreqSetting);
-                } else {
-                    lastFreqSetting = new AppSetting("lastFreq", frequencyStr);
-                    viewModel.appDb.appSettingDao().insertAll(lastFreqSetting);
-                }
+                synchronized(ctx) { // Avoid 2 threads checking if something is set / setting it at once.
+                    AppSetting lastFreqSetting = viewModel.appDb.appSettingDao().getByName("lastFreq");
+                    if (lastFreqSetting != null) {
+                        lastFreqSetting.value = frequencyStr;
+                        viewModel.appDb.appSettingDao().update(lastFreqSetting);
+                    } else {
+                        lastFreqSetting = new AppSetting("lastFreq", frequencyStr);
+                        viewModel.appDb.appSettingDao().insertAll(lastFreqSetting);
+                    }
 
-                // And clear out any saved memory ID, so we restore to a simplex freq on restart.
-                AppSetting lastMemoryIdSetting = viewModel.appDb.appSettingDao().getByName("lastMemoryId");
-                if (lastMemoryIdSetting != null) {
-                    lastMemoryIdSetting.value = "-1";
-                    viewModel.appDb.appSettingDao().update(lastMemoryIdSetting);
-                } else {
-                    lastMemoryIdSetting = new AppSetting("lastMemoryId", "-1");
-                    viewModel.appDb.appSettingDao().insertAll(lastMemoryIdSetting);
+                    // And clear out any saved memory ID, so we restore to a simplex freq on restart.
+                    AppSetting lastMemoryIdSetting = viewModel.appDb.appSettingDao().getByName("lastMemoryId");
+                    if (lastMemoryIdSetting != null) {
+                        lastMemoryIdSetting.value = "-1";
+                        viewModel.appDb.appSettingDao().update(lastMemoryIdSetting);
+                    } else {
+                        lastMemoryIdSetting = new AppSetting("lastMemoryId", "-1");
+                        viewModel.appDb.appSettingDao().insertAll(lastMemoryIdSetting);
+                    }
                 }
             }
         });
@@ -914,7 +1164,7 @@ public class MainActivity extends AppCompatActivity {
 
         // Unhighlight all memory rows, since this is a simplex frequency.
         viewModel.highlightMemory(null);
-        adapter.notifyDataSetChanged();
+        memoriesAdapter.notifyDataSetChanged();
     }
 
     /**
@@ -969,6 +1219,7 @@ public class MainActivity extends AppCompatActivity {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                Log.d("DEBUG", "showFrequency: " + frequency);
                 EditText activeFrequencyField = findViewById(R.id.activeFrequency);
                 activeFrequencyField.setText(frequency);
                 activeFrequencyStr = frequency;
@@ -1165,7 +1416,8 @@ public class MainActivity extends AppCompatActivity {
     private void showUSBSnackbar() {
         CharSequence snackbarMsg = "kv4p HT radio not found, plugged in?";
         usbSnackbar = Snackbar.make(this, findViewById(R.id.mainTopLevelLayout), snackbarMsg, Snackbar.LENGTH_INDEFINITE)
-            .setBackgroundTint(Color.rgb(140, 20, 0)).setActionTextColor(Color.WHITE).setTextColor(Color.WHITE);
+            .setBackgroundTint(Color.rgb(140, 20, 0)).setActionTextColor(Color.WHITE).setTextColor(Color.WHITE)
+            .setAnchorView(findViewById(R.id.bottomNavigationView));
 
         // Make the text of the snackbar larger.
         TextView snackbarActionTextView = (TextView) usbSnackbar.getView().findViewById(com.google.android.material.R.id.snackbar_action);
@@ -1176,10 +1428,22 @@ public class MainActivity extends AppCompatActivity {
         usbSnackbar.show();
     }
 
+    /**
+     * Alerts the user to missing or old firmware with the option to flash the latest.
+     * @param firmwareVer The currently installed firmware version, or -1 if no firmware installed.
+     */
     private void showVersionSnackbar(int firmwareVer) {
-        CharSequence snackbarMsg = "Unsupported kv4p HT firmware version (" + firmwareVer + "), please update.";
+        final Context ctx = this;
+        CharSequence snackbarMsg = firmwareVer == -1 ? "No firmware installed" : "New firmware available";
         versionSnackbar = Snackbar.make(this, findViewById(R.id.mainTopLevelLayout), snackbarMsg, Snackbar.LENGTH_INDEFINITE)
-                .setBackgroundTint(Color.rgb(140, 20, 0)).setActionTextColor(Color.WHITE).setTextColor(Color.WHITE);
+                .setBackgroundTint(Color.rgb(140, 20, 0)).setActionTextColor(Color.WHITE).setTextColor(Color.WHITE)
+                .setAction("Flash now", new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        startFirmwareActivity();
+                    }
+                })
+                .setAnchorView(findViewById(R.id.bottomNavigationView));
 
         // Make the text of the snackbar larger.
         TextView snackbarActionTextView = (TextView) versionSnackbar.getView().findViewById(com.google.android.material.R.id.snackbar_action);
@@ -1327,7 +1591,7 @@ public class MainActivity extends AppCompatActivity {
             case REQUEST_ADD_MEMORY:
                 if (resultCode == Activity.RESULT_OK) {
                     viewModel.loadData();
-                    adapter.notifyDataSetChanged();
+                    memoriesAdapter.notifyDataSetChanged();
                 }
                 break;
             case REQUEST_EDIT_MEMORY:
@@ -1343,7 +1607,7 @@ public class MainActivity extends AppCompatActivity {
                             runOnUiThread(new Runnable() {
                                 @Override
                                 public void run() {
-                                    adapter.notifyDataSetChanged();
+                                    memoriesAdapter.notifyDataSetChanged();
                                     // Tune to the edited memory to force any changes to be applied (e.g. new tone
                                     // or frequency).
                                     List<ChannelMemory> channelMemories = viewModel.getChannelMemories().getValue();
@@ -1369,9 +1633,49 @@ public class MainActivity extends AppCompatActivity {
             case REQUEST_SETTINGS:
                 // Don't need to do anything here, since settings are applied in onResume() anyway.
                 break;
+            case REQUEST_FIRMWARE:
+                if (resultCode == Activity.RESULT_OK) {
+                    showSimpleSnackbar("Successfully updated firmware");
+
+                    // Try to reconnect now that the kv4p HT firmware should be present
+                    if (null != radioAudioService) {
+                        radioAudioService.reconnectViaUSB();
+                    }
+                }
+                break;
             default:
                 Log.d("DEBUG", "Warning: Returned to MainActivity from unexpected request code: " + requestCode);
         }
+    }
+
+    private void showSimpleSnackbar(String msg) {
+        Snackbar simpleSnackbar = Snackbar.make(this, findViewById(R.id.mainTopLevelLayout), msg, Snackbar.LENGTH_LONG)
+                .setBackgroundTint(getResources().getColor(R.color.primary))
+                .setTextColor(getResources().getColor(R.color.medium_gray));
+
+        // Make the text of the snackbar larger.
+        TextView snackbarTextView = (TextView) simpleSnackbar.getView().findViewById(com.google.android.material.R.id.snackbar_text);
+        snackbarTextView.setTextSize(20);
+
+        simpleSnackbar.show();
+    }
+
+    private void startFirmwareActivity() {
+        // Stop any scanning or transmitting
+        if (radioAudioService != null) {
+            radioAudioService.setScanning(false);
+            radioAudioService.endPtt();
+        }
+        endPttUi();
+        setScanningUi(false);
+
+        // Tell the radioAudioService to hold on while we flash.
+        radioAudioService.setMode(RadioAudioService.MODE_FLASHING);
+
+        // Actually start the firmware activity
+        Intent intent = new Intent("com.vagell.kv4pht.FIRMWARE_ACTION");
+        intent.putExtra("requestCode", REQUEST_FIRMWARE);
+        startActivityForResult(intent, REQUEST_FIRMWARE);
     }
 
     public void settingsClicked(View view) {

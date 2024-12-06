@@ -31,6 +31,7 @@ import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbManager;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.AudioTrack;
 import android.os.Binder;
@@ -56,6 +57,7 @@ import com.vagell.kv4pht.aprs.parser.InformationField;
 import com.vagell.kv4pht.aprs.parser.MessagePacket;
 import com.vagell.kv4pht.aprs.parser.Parser;
 import com.vagell.kv4pht.data.ChannelMemory;
+import com.vagell.kv4pht.firmware.FirmwareUtils;
 import com.vagell.kv4pht.javAX25.ax25.Afsk1200Modulator;
 import com.vagell.kv4pht.javAX25.ax25.Afsk1200MultiDemodulator;
 import com.vagell.kv4pht.javAX25.ax25.Packet;
@@ -92,10 +94,7 @@ public class RadioAudioService extends Service {
     private static final int[] ESP32_VENDOR_IDS = {4292};
     private static final int[] ESP32_PRODUCT_IDS = {60000};
 
-    // Minimum Arduino (ESP32) app firmware version this Android app can communicate with.
-    // Should be incremented whenever there's a message format change, new data rate,
-    // new commands, etc.
-    private static final int MIN_FIRMWARE_VER = 1;
+    // Version related constants (also see FirmwareUtils for others)
     private static final String VERSION_PREFIX = "VERSION";
     private static String versionStrBuffer = "";
     private static final int VERSION_LENGTH = 8; // Chars in the version string from ESP32 app.
@@ -104,10 +103,12 @@ public class RadioAudioService extends Service {
     public static final int MODE_RX = 0;
     public static final int MODE_TX = 1;
     public static final int MODE_SCAN = 2;
+    public static final int MODE_BAD_FIRMWARE = 3;
+    public static final int MODE_FLASHING = 4;
     private int mode = MODE_STARTUP;
     private int messageNumber = 0;
 
-    private enum ESP32Command {
+    public enum ESP32Command {
         PTT_DOWN((byte) 1),
         PTT_UP((byte) 2),
         TUNE_TO((byte) 3), // paramsStr contains freq, offset, tone details
@@ -137,7 +138,7 @@ public class RadioAudioService extends Service {
     public static final  int minBufferSize = AudioRecord.getMinBufferSize(AUDIO_SAMPLE_RATE, channelConfig, audioFormat) * 2;
     private UsbManager usbManager;
     private UsbDevice esp32Device;
-    private UsbSerialPort serialPort;
+    private static UsbSerialPort serialPort;
     private SerialInputOutputManager usbIoManager;
     private static final int TX_AUDIO_CHUNK_SIZE = 512; // Tx audio bytes to send to ESP32 in a single USB write
     private Map<String, Integer> mTones = new HashMap<>();
@@ -168,6 +169,7 @@ public class RadioAudioService extends Service {
     private String callsign = null;
     private int consecutiveSilenceBytes = 0; // To determine when to move scan after silence
     private int activeMemoryId = -1; // -1 means we're in simplex mode
+    private static int maxFreq = 148; // in MHz
 
     // Safety constants
     private static int RUNAWAY_TX_TIMEOUT_SEC = 180; // Stop runaway tx after 3 minutes
@@ -209,7 +211,24 @@ public class RadioAudioService extends Service {
         setRadioFilters(emphasis, highpass, lowpass);
     }
 
+    public static void setMaxFreq(int newMaxFreq) {
+        maxFreq = newMaxFreq;
+    }
+
     public void setMode(int mode) {
+        switch (mode) {
+            case MODE_FLASHING:
+                sendCommandToESP32(RadioAudioService.ESP32Command.STOP);
+                audioTrack.stop();
+                usbIoManager.stop();
+                break;
+            default:
+                if (null != usbIoManager && usbIoManager.getState() == SerialInputOutputManager.State.STOPPED) {
+                    usbIoManager.start();
+                }
+                break;
+        }
+
         this.mode = mode;
     }
 
@@ -284,7 +303,12 @@ public class RadioAudioService extends Service {
         public void audioTrackCreated();
         public void packetReceived(APRSPacket aprsPacket);
         public void scannedToMemory(int memoryId);
-        public void unsupportedFirmware(int firmwareVer);
+        public void outdatedFirmware(int firmwareVer);
+        public void missingFirmware();
+        public void txAllowed(boolean allowed);
+        public void txStarted();
+        public void txEnded();
+        public void chatError(String snackbarText);
     }
 
     public void setCallbacks(RadioAudioServiceCallbacks callbacks) {
@@ -389,6 +413,16 @@ public class RadioAudioService extends Service {
 
         // Reset audio prebuffer
         restartAudioPrebuffer();
+
+        try {
+            Float freq = Float.parseFloat(activeFrequencyStr);
+            if (freq < 144.0f || freq > maxFreq) {
+                callbacks.txAllowed(false);
+            } else {
+                callbacks.txAllowed(true);
+            }
+        } catch (NumberFormatException nfe) {
+        }
     }
 
     public static String makeSafe2MFreq(String strFreq) {
@@ -396,48 +430,25 @@ public class RadioAudioService extends Service {
         try {
             freq = Float.parseFloat(strFreq);
         } catch (NumberFormatException nfe) { // Not sure how some people are breaking this, but default to FM calling frequency if we can't understand strFreq.
-            nfe.printStackTrace();
-            return "146.520";
+            return "144.0000";
         }
-        while (freq > 148.0f) { // Handle cases where user inputted "1467" or "14670" but meant "146.7".
+        while (freq > 500.0f) { // Handle cases where user inputted "1467" or "14670" but meant "146.7".
             freq /= 10;
         }
-        freq = Math.min(freq, 148.0f);
-        freq = Math.max(freq, 144.0f);
 
-        strFreq = String.format(java.util.Locale.US,"%.3f", freq);
-        strFreq = formatFrequency(strFreq);
+        if (freq < 134.0f) {
+            freq = 134.0f; // Lowest freq supported by radio module
+        } else if (freq > 174.0f) {
+            freq = 174.0f; // Highest freq supported
+        }
+
+        strFreq = String.format(java.util.Locale.US,"%.4f", freq);
 
         return strFreq;
     }
 
-    public static String formatFrequency(String tempFrequency) {
-        tempFrequency = tempFrequency.trim();
-
-        // Pad any missing zeroes to match format expected by radio module.
-        if (tempFrequency.matches("14[4-8]\\.[0-9][0-9][0-9]")) {
-            return tempFrequency;
-        } else if (tempFrequency.matches("14[4-8]\\.[0-9][0-9]")) {
-            return tempFrequency + "0";
-        } else if (tempFrequency.matches("14[4-8]\\.[0-9]")) {
-            return tempFrequency + "00";
-        } else if (tempFrequency.matches("14[4-8]\\.")) {
-            return tempFrequency + "000";
-        } else if (tempFrequency.matches("14[4-8]")) {
-            return tempFrequency + ".000";
-        } else if (tempFrequency.matches("14[4-8][0-9][0-9][0-9]")) {
-            return tempFrequency.substring(0, 3) + "." + tempFrequency.substring(3, 6);
-        } else if (tempFrequency.matches("14[4-8][0-9][0-9]")) {
-            return tempFrequency.substring(0, 3) + "." + tempFrequency.substring(3, 5) + "0";
-        } else if (tempFrequency.matches("14[4-8][0-9]")) {
-            return tempFrequency.substring(0, 3) + "." + tempFrequency.substring(3, 4) + "00";
-        }
-
-        return null;
-    }
-
     public String validateFrequency(String tempFrequency) {
-        String newFrequency = formatFrequency(tempFrequency);
+        String newFrequency = makeSafe2MFreq(tempFrequency);
 
         // Resort to the old frequency, the one the user inputted is unsalvageable.
         return newFrequency == null ? activeFrequencyStr : newFrequency;
@@ -489,6 +500,16 @@ public class RadioAudioService extends Service {
 
         // Reset audio prebuffer
         restartAudioPrebuffer();
+
+        try {
+            Float txFreq = Float.parseFloat(getTxFreq(memory.frequency, memory.offset));
+            if (txFreq < 144.0f || txFreq > maxFreq) {
+                callbacks.txAllowed(false);
+            } else {
+                callbacks.txAllowed(true);
+            }
+        } catch (NumberFormatException nfe) {
+        }
     }
 
     private String getToneIdxStr(String toneStr) {
@@ -528,6 +549,10 @@ public class RadioAudioService extends Service {
     }
 
     private void initAudioTrack() {
+        if (audioTrack != null) {
+            audioTrack.release();
+            audioTrack = null;
+        }
         audioTrack = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -540,7 +565,9 @@ public class RadioAudioService extends Service {
                         .build())
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .setBufferSizeInBytes(minBufferSize)
+                .setSessionId(AudioManager.AUDIO_SESSION_ID_GENERATE)
                 .build();
+        audioTrack.setAuxEffectSendLevel(0.0f);
 
         restartAudioPrebuffer();
 
@@ -549,7 +576,7 @@ public class RadioAudioService extends Service {
         }
     }
 
-    public void startPtt(boolean dataMode) {
+    public void startPtt() {
         setMode(MODE_TX);
 
         // Setup runaway tx safety measures.
@@ -576,6 +603,7 @@ public class RadioAudioService extends Service {
 
         sendCommandToESP32(ESP32Command.PTT_DOWN);
         audioTrack.stop();
+        callbacks.txStarted();
     }
 
     public void endPtt() {
@@ -586,6 +614,7 @@ public class RadioAudioService extends Service {
         sendCommandToESP32(ESP32Command.PTT_UP);
         audioTrack.flush();
         restartAudioPrebuffer();
+        callbacks.txEnded();
     }
 
     public void reconnectViaUSB() {
@@ -625,6 +654,9 @@ public class RadioAudioService extends Service {
         int vendorId = device.getVendorId();
         int productId = device.getProductId();
         Log.d("DEBUG", "vendorId: " + vendorId + " productId: " + productId + " name: " + device.getDeviceName());
+        // TODO these vendor and product checks might be too rigid/brittle for future PCBs,
+        // especially those that are more custom and not a premade dev board. But we need some way
+        // to tell if the given USB device is an ESP32 so we can interact with the right device.
         for (int i = 0; i < ESP32_VENDOR_IDS.length; i++) {
             if ((vendorId == ESP32_VENDOR_IDS[i]) && (productId == ESP32_PRODUCT_IDS[i])) {
                 return true;
@@ -724,6 +756,22 @@ public class RadioAudioService extends Service {
         sendCommandToESP32(ESP32Command.STOP); // Tell ESP32 app to stop whatever it's doing.
         sendCommandToESP32(ESP32Command.GET_FIRMWARE_VER); // Ask for firmware ver.
         // The version is actually evaluated in handleESP32Data().
+
+        // If we don't hear back from the ESP32, it means the firmware is either not
+        // installed or it's somehow corrupt.
+        final Handler handler = new Handler(Looper.getMainLooper());
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (mode != MODE_STARTUP) {
+                    return;
+                } else {
+                    Log.d("DEBUG", "Error: Did not hear back from ESP32 after requesting its firmware version. Offering to flash.");
+                    callbacks.missingFirmware();
+                    setMode(MODE_BAD_FIRMWARE);
+                }
+            }
+        }, 6000);
     }
 
     private void initAfterESP32Connected() {
@@ -797,6 +845,11 @@ public class RadioAudioService extends Service {
         }
 
         consecutiveSilenceBytes = 0;
+
+        if (null == memoryToScanNext) { // Unclear how this could happen, but exception occurred in the wild (GitHub issue #99).
+            Log.d("DEBUG", "Warning: Tried to scan to null memory, skipping it.");
+            return;
+        }
 
         // Log.d("DEBUG", "Scanning to: " + memoryToScanNext.name);
         tuneToMemory(memoryToScanNext, squelch > 0 ? squelch : 1, true); // If user turned off squelch, set it to 1 during scan.
@@ -873,12 +926,22 @@ public class RadioAudioService extends Service {
     }
 
     public synchronized void sendBytesToESP32(byte[] newBytes) {
+        if (mode == MODE_BAD_FIRMWARE) {
+            Log.d("DEBUG", "Warning: Attempted to send bytes to ESP32 with bad firmware.");
+            return;
+        }
+
+        if (mode == MODE_FLASHING) {
+            Log.d("DEBUG", "Warning: Attempted to send bytes to ESP32 while in the process of flashing a new firmware.");
+            return;
+        }
+
+        int usbRetries = 0;
         try {
             // usbIoManager.writeAsync(newBytes); // On MCUs like the ESP32 S2 this causes USB failures with concurrent USB rx/tx.
             int bytesWritten = 0;
             int totalBytes = newBytes.length;
             final int MAX_BYTES_PER_USB_WRITE = 128;
-            int usbRetries = 0;
             do {
                 try {
                     byte[] arrayPart = Arrays.copyOfRange(newBytes, bytesWritten, Math.min(bytesWritten + MAX_BYTES_PER_USB_WRITE, totalBytes));
@@ -888,7 +951,7 @@ public class RadioAudioService extends Service {
                 } catch (SerialTimeoutException ste) {
                     // Do nothing, we'll try again momentarily. ESP32's serial buffer may be full.
                     usbRetries++;
-                    // Log.d("DEBUG", "usbRetries: " + usbRetries);
+                    Log.d("DEBUG", "usbRetries: " + usbRetries);
                 }
             } while (bytesWritten < totalBytes && usbRetries < 10);
             // Log.d("DEBUG", "Wrote data: " + Arrays.toString(newBytes));
@@ -906,13 +969,20 @@ public class RadioAudioService extends Service {
             }
             findESP32Device(); // Attempt to reconnect after the brief pause above.
         }
+        if (usbRetries == 10) {
+            Log.d("DEBUG", "sendBytesToESP32: Connected to ESP32 via USB serial, but could not send data after 10 retries.");
+        }
+    }
+
+    public static UsbSerialPort getUsbSerialPort() {
+        return serialPort;
     }
 
     private void handleESP32Data(byte[] data) {
             // Log.d("DEBUG", "Got bytes from ESP32: " + Arrays.toString(data));
          /* try {
             String dataStr = new String(data, "UTF-8");
-            //if (dataStr.length() < 100 && dataStr.length() > 0)
+            if (dataStr.length() < 100 && dataStr.length() > 0)
                 Log.d("DEBUG", "Str data from ESP32: " + dataStr);
             } catch (UnsupportedEncodingException e) {
                 throw new RuntimeException(e);
@@ -932,14 +1002,14 @@ public class RadioAudioService extends Service {
                         return; // Version string not yet fully received.
                     }
                     int verInt = Integer.parseInt(verStr);
-                    if (verInt < MIN_FIRMWARE_VER) {
-                        Log.d("DEBUG", "Error: ESP32 app firmware is " + verInt + " but Android app requires at least " + MIN_FIRMWARE_VER);
+                    if (verInt < FirmwareUtils.PACKAGED_FIRMWARE_VER) {
+                        Log.d("DEBUG", "Error: ESP32 app firmware " + verInt + " is older than latest firmware " + FirmwareUtils.PACKAGED_FIRMWARE_VER);
                         if (callbacks != null) {
-                            callbacks.unsupportedFirmware(verInt);
+                            callbacks.outdatedFirmware(verInt);
                             versionStrBuffer = "";
                         }
                     } else {
-                        Log.d("DEBUG", "Supported ESP32 app firmware version detected (" + verInt + " >= " + MIN_FIRMWARE_VER + ").");
+                        Log.d("DEBUG", "Recent ESP32 app firmware version detected (" + verInt + ").");
                         versionStrBuffer = ""; // Reset the version string buffer for next USB reconnect.
                         initAfterESP32Connected();
                     }
@@ -1010,6 +1080,11 @@ public class RadioAudioService extends Service {
                 throw new RuntimeException(e);
             } */
         }
+
+        if (mode == MODE_BAD_FIRMWARE) {
+            // Log.d("DEBUG", "Warning: Received data from ESP32 which was thought to have bad firmware.");
+            // Just ignore any data we get in this mode, who knows what is programmed on the ESP32.
+        }
     }
 
     private float[] convertPCM8ToFloatArray(byte[] pcm8Data) {
@@ -1055,15 +1130,9 @@ public class RadioAudioService extends Service {
                     InformationField infoField = aprsPacket.getAprsInformation();
                     if (infoField.getDataTypeIdentifier() == ':') { // APRS "message" type. What we expect for our text chat.
                         MessagePacket messagePacket = new MessagePacket(infoField.getRawBytes(), aprsPacket.getDestinationCall());
-                        if (messagePacket.isAck()) { // Don't list ACKs in chat log, or notify about them.
-                            // TODO in the future, when chat log isn't just plain text, we can add a checkmark to ACK'd messages we sent.
-                            Log.d("DEBUG", "Received ACK: " + messagePacket.toString());
-                            return;
-                        }
-                        finalString = aprsPacket.getSourceCall() + " to " + messagePacket.getTargetCallsign() + ": " + messagePacket.getMessageBody();
 
                         // If the message was addressed to us, notify the user and ACK the message to the sender.
-                        if (messagePacket.getTargetCallsign().toUpperCase().equals(callsign.toUpperCase())) {
+                        if (messagePacket.getTargetCallsign().trim().toUpperCase().equals(callsign.toUpperCase())) {
                             showNotification(MESSAGE_NOTIFICATION_CHANNEL_ID, MESSAGE_NOTIFICATION_TO_YOU_ID,
                                     aprsPacket.getSourceCall() + " messaged you", messagePacket.getMessageBody(), MainActivity.INTENT_OPEN_CHAT);
                             sendAckMessage(aprsPacket.getSourceCall().toUpperCase(), messagePacket.getMessageNumber());
@@ -1115,8 +1184,23 @@ public class RadioAudioService extends Service {
         ArrayList<Digipeater> digipeaters = new ArrayList<>();
         digipeaters.add(new Digipeater("WIDE1*"));
         digipeaters.add(new Digipeater("WIDE2-1"));
-        APRSPacket aprsPacket = new APRSPacket(callsign, targetCallsign, digipeaters, msgPacket.getRawBytes());
-        Packet ax25Packet = new Packet(aprsPacket.toAX25Frame());
+        if (null == callsign || callsign.trim().equals("")) {
+            Log.d("DEBUG", "Error: Tried to send a chat message with no sender callsign.");
+            return;
+        }
+        if (null == targetCallsign || targetCallsign.trim().equals("")) {
+            Log.d("DEBUG", "Warning: Tried to send a chat message with no recipient callsign, defaulted to 'CQ'.");
+            targetCallsign = "CQ";
+        }
+
+        Packet ax25Packet = null;
+        try {
+            APRSPacket aprsPacket = new APRSPacket(callsign, targetCallsign, digipeaters, msgPacket.getRawBytes());
+            ax25Packet = new Packet(aprsPacket.toAX25Frame());
+        } catch (IllegalArgumentException iae) {
+            callbacks.chatError("Error in your callsign or To: callsign.");
+            return;
+        }
 
         // TODO start a timer to re-send this packet (up to a few times) if we don't receive an ACK for it.
         txAX25Packet(ax25Packet);
@@ -1138,7 +1222,7 @@ public class RadioAudioService extends Service {
         }
         byte[] simpleAudioBytes = ArrayUtils.toPrimitive(audioBytes.toArray(new Byte[0]));
 
-        startPtt(true);
+        startPtt();
         final Handler handler = new Handler(Looper.getMainLooper());
         handler.postDelayed(new Runnable() {
             @Override
